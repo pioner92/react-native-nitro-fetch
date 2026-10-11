@@ -17,8 +17,11 @@ namespace margelo::nitro::nitrofetchwebsockets {
 #endif
 
 #include <NitroModules/ArrayBuffer.hpp>
+#include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
+#include <vector>
 
 namespace margelo::nitro::nitrofetchwebsockets {
 
@@ -46,6 +49,31 @@ WebSocketConnectionBase::OnMessage makeHybridMessageBridge(
     std::function<void(const HybridWebSocketMessageEvent&)> cb) {
   return [cb = std::move(cb)](const uint8_t* data, size_t len, bool isBinary) {
     cb(HybridWebSocketMessageEvent{ copyPayloadToArrayBuffer(data, len), isBinary });
+  };
+}
+
+bool isAscii(const uint8_t* s, size_t len) {
+  size_t i = 0;
+  while (i + 8 <= len) {
+    uint64_t chunk;
+    std::memcpy(&chunk, s + i, 8);
+    if (chunk & 0x8080808080808080ULL) return false;
+    i += 8;
+  }
+  while (i < len) {
+    if (s[i] >= 0x80) return false;
+    i++;
+  }
+  return true;
+}
+
+WebSocketConnectionBase::OnMessage makeBatchBridge(std::function<void(WebSocketMessageQueue)> onBatch) {
+  WebSocketMessageQueue queue;
+  return [onBatch = std::move(onBatch), queue](const uint8_t* data, size_t len, bool isBinary) {
+    std::optional<WebSocketMessageQueue> batch = !isBinary && isAscii(data, len)
+      ? queue.push(WebSocketMessageQueue::Text{ std::vector<uint8_t>(data, data + len), true })
+      : queue.push(HybridWebSocketMessageEvent{ copyPayloadToArrayBuffer(data, len), isBinary });
+    if (batch) onBatch(std::move(*batch));
   };
 }
 
@@ -111,8 +139,22 @@ std::optional<std::function<void(const HybridWebSocketMessageEvent&)>> HybridWeb
 void HybridWebSocket::setOnMessage(
     const std::optional<std::function<void(const HybridWebSocketMessageEvent&)>>& cb) {
   _onMessage = cb;
-  if (cb) {
-    _conn->setOnMessage(makeHybridMessageBridge(*cb));
+  bindMessages();
+}
+
+std::optional<std::function<void(WebSocketMessageQueue)>> HybridWebSocket::getOnMessageBatch() {
+  return _onMessageBatch;
+}
+void HybridWebSocket::setOnMessageBatch(const std::optional<std::function<void(WebSocketMessageQueue)>>& cb) {
+  _onMessageBatch = cb;
+  bindMessages();
+}
+
+void HybridWebSocket::bindMessages() {
+  if (_onMessageBatch) {
+    _conn->setOnMessage(makeBatchBridge(*_onMessageBatch));
+  } else if (_onMessage) {
+    _conn->setOnMessage(makeHybridMessageBridge(*_onMessage));
   } else {
     _conn->setOnMessage({});
   }
@@ -183,12 +225,7 @@ void HybridWebSocket::bindCallbacks() {
   _conn->setOnOpen(onOpen ? [onOpen = *onOpen]() { onOpen(); }
                            : WebSocketConnectionBase::OnOpen{});
 
-  auto onMsg = _onMessage;
-  if (onMsg) {
-    _conn->setOnMessage(makeHybridMessageBridge(*onMsg));
-  } else {
-    _conn->setOnMessage({});
-  }
+  bindMessages();
 
   auto onClose = _onClose;
   if (onClose) {
