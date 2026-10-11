@@ -25,36 +25,63 @@ struct ParsedUrl {
   int port;
   std::string path;
   bool isWss;
+  std::string hostHeader;
 };
 
 static ParsedUrl parseUrl(const std::string& url) {
   ParsedUrl r;
-  r.port  = 0;
-  r.isWss = false;
-
-  std::string rest;
-  if (url.rfind("wss://", 0) == 0) {
+  const size_t schemeEnd = url.find("://");
+  std::string scheme = schemeEnd == std::string::npos ? std::string() : url.substr(0, schemeEnd);
+  std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (scheme == "wss" || scheme == "https") {
     r.isWss = true;
-    rest    = url.substr(6);
     r.port  = 443;
-  } else if (url.rfind("ws://", 0) == 0) {
-    rest   = url.substr(5);
-    r.port = 80;
+  } else if (scheme == "ws" || scheme == "http") {
+    r.isWss = false;
+    r.port  = 80;
   } else {
     throw std::invalid_argument("Unsupported WebSocket URL scheme: " + url);
   }
+  const int defaultPort = r.port;
 
-  auto pathStart = rest.find('/');
-  std::string hostPort = (pathStart == std::string::npos) ? rest : rest.substr(0, pathStart);
-  r.path = (pathStart == std::string::npos) ? "/" : rest.substr(pathStart);
+  const size_t authorityStart = schemeEnd + 3;
+  const size_t authorityEnd = url.find_first_of("/?#", authorityStart);
+  std::string authority = url.substr(authorityStart, authorityEnd == std::string::npos
+    ? std::string::npos : authorityEnd - authorityStart);
+  const size_t at = authority.rfind('@');
+  if (at != std::string::npos) authority = authority.substr(at + 1);
 
-  auto colonPos = hostPort.find(':');
-  if (colonPos != std::string::npos) {
-    r.host = hostPort.substr(0, colonPos);
-    r.port = std::stoi(hostPort.substr(colonPos + 1));
+  std::string port;
+  if (!authority.empty() && authority[0] == '[') {
+    const size_t close = authority.find(']');
+    if (close == std::string::npos ||
+        (close + 1 < authority.size() && authority[close + 1] != ':')) {
+      throw std::invalid_argument("Invalid WebSocket URL: " + url);
+    }
+    r.host = authority.substr(1, close - 1);
+    if (close + 1 < authority.size()) port = authority.substr(close + 2);
   } else {
-    r.host = hostPort;
+    const size_t colon = authority.rfind(':');
+    r.host = authority.substr(0, colon);
+    if (colon != std::string::npos) port = authority.substr(colon + 1);
   }
+  if (r.host.empty()) throw std::invalid_argument("Invalid WebSocket URL: " + url);
+  if (!port.empty()) {
+    if (port.size() > 5 || port.find_first_not_of("0123456789") != std::string::npos) {
+      throw std::invalid_argument("Invalid WebSocket URL: " + url);
+    }
+    r.port = std::stoi(port);
+    if (r.port < 1 || r.port > 65535) throw std::invalid_argument("Invalid WebSocket URL: " + url);
+  }
+
+  r.path = authorityEnd == std::string::npos ? std::string() : url.substr(authorityEnd);
+  const size_t fragment = r.path.find('#');
+  if (fragment != std::string::npos) r.path.resize(fragment);
+  if (r.path.empty() || r.path[0] != '/') r.path = "/" + r.path;
+
+  r.hostHeader = r.host.find(':') != std::string::npos ? "[" + r.host + "]" : r.host;
+  if (r.port != defaultPort) r.hostHeader += ":" + std::to_string(r.port);
   return r;
 }
 
@@ -178,8 +205,9 @@ void WebSocketConnection::connect(
   auto path        = parsed.path;
   auto protoStr    = protocolStr;
   auto isWss       = parsed.isWss;
+  auto hostHeader  = parsed.hostHeader;
 
-  LwsContext::instance().schedule([self, host, port, path, protoStr, isWss]() {
+  LwsContext::instance().schedule([self, host, port, path, protoStr, isWss, hostHeader]() {
     self->_selfRef = self;
 
     lws_client_connect_info i = {};
@@ -187,7 +215,7 @@ void WebSocketConnection::connect(
     i.address      = host.c_str();
     i.port         = port;
     i.path         = path.c_str();
-    i.host         = host.c_str();
+    i.host         = hostHeader.c_str();
     i.protocol     = protoStr.empty() ? nullptr : protoStr.c_str();
     i.local_protocol_name = "nitro-ws";
     i.userdata     = self.get();
