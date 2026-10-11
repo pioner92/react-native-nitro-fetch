@@ -6,9 +6,22 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <CFNetwork/CFNetwork.h>
+#import <CommonCrypto/CommonDigest.h>
+#import <Network/Network.h>
+#import <Security/SecureTransport.h>
 #include "NWWebSocketConnection.hpp"
+#include "Utf8.hpp"
 
+#include <sys/utsname.h>
+#include <zlib.h>
+
+#include <algorithm>
+#include <cerrno>
 #include <cstring>
+#include <deque>
+#include <optional>
+#include <string_view>
 
 #if defined(NITRO_WS_TRACING)
 #include <os/log.h>
@@ -20,513 +33,1246 @@ static os_log_t nitroWsLog() {
 }
 #endif
 
-// ── ObjC delegate bridging NSURLSession events to C++ via blocks ────────
-
-@interface NWWSDelegate : NSObject <NSURLSessionWebSocketDelegate, NSURLSessionTaskDelegate>
-@property (nonatomic, copy) void (^onOpen)(NSString* _Nullable protocol);
-@property (nonatomic, copy) void (^onServerClose)(int code, NSString* _Nullable reason);
-@property (nonatomic, copy) void (^onComplete)(NSError* _Nullable error);
-@end
-
-@implementation NWWSDelegate
-
-- (void)URLSession:(NSURLSession *)session
-    webSocketTask:(NSURLSessionWebSocketTask *)webSocketTask
-    didOpenWithProtocol:(NSString *)protocol {
-  if (self.onOpen) self.onOpen(protocol);
-}
-
-- (void)URLSession:(NSURLSession *)session
-    webSocketTask:(NSURLSessionWebSocketTask *)webSocketTask
-    didCloseWithCode:(NSURLSessionWebSocketCloseCode)closeCode
-             reason:(NSData *)reason {
-  NSString *reasonStr = nil;
-  if (reason) {
-    reasonStr = [[NSString alloc] initWithData:reason encoding:NSUTF8StringEncoding];
-  }
-  if (self.onServerClose) self.onServerClose(static_cast<int>(closeCode), reasonStr);
-}
-
-- (void)URLSession:(NSURLSession *)session
-              task:(NSURLSessionTask *)task
-    didCompleteWithError:(NSError *)error {
-  if (self.onComplete) self.onComplete(error);
-}
-
-@end
-
-
 namespace margelo::nitro::nitrofetchwebsockets {
 
-// ── PIMPL (holds ARC-managed Foundation objects) ─────────────────────────
+namespace {
+
+constexpr uint8_t kOpContinuation = 0x0;
+constexpr uint8_t kOpText = 0x1;
+constexpr uint8_t kOpBinary = 0x2;
+constexpr uint8_t kOpClose = 0x8;
+constexpr uint8_t kOpPing = 0x9;
+constexpr uint8_t kOpPong = 0xA;
+constexpr uint8_t kFin = 0x80;
+constexpr uint8_t kRsv1 = 0x40;
+
+constexpr size_t kMaxMessageSize = 16 * 1024 * 1024;
+constexpr size_t kMaxHandshakeSize = 256 * 1024;
+constexpr uint32_t kReadSize = 4 * 1024 * 1024;
+constexpr int kMaxRedirects = 20;
+constexpr size_t kMinDeflateSize = 7;
+constexpr int64_t kHandshakeTimeout = 60 * NSEC_PER_SEC;
+
+struct BufferedMessage {
+  std::vector<uint8_t> data;
+  bool isBinary;
+};
+
+using Fields = std::vector<std::pair<std::string, std::string>>;
+
+bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); i++) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+  }
+  return true;
+}
+
+std::string_view trim(std::string_view s) {
+  while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
+  return s;
+}
+
+std::vector<std::string_view> split(std::string_view s, char separator) {
+  std::vector<std::string_view> parts;
+  size_t start = 0;
+  while (true) {
+    size_t end = s.find(separator, start);
+    parts.push_back(trim(s.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start)));
+    if (end == std::string_view::npos) return parts;
+    start = end + 1;
+  }
+}
+
+bool hasToken(std::string_view list, std::string_view token) {
+  for (auto part : split(list, ',')) {
+    if (equalsIgnoreCase(part, token)) return true;
+  }
+  return false;
+}
+
+const std::string* findField(const Fields& fields, std::string_view name) {
+  for (const auto& field : fields) {
+    if (equalsIgnoreCase(field.first, name)) return &field.second;
+  }
+  return nullptr;
+}
+
+void setField(Fields& fields, const std::string& name, const std::string& value) {
+  for (auto& field : fields) {
+    if (equalsIgnoreCase(field.first, name)) {
+      field = { name, value };
+      return;
+    }
+  }
+  fields.emplace_back(name, value);
+}
+
+std::string stdString(NSString* s) {
+  const char* utf8 = s.UTF8String;
+  return utf8 ? std::string(utf8) : std::string();
+}
+
+std::optional<std::string> headerValue(CFHTTPMessageRef message, CFStringRef name) {
+  NSString* value = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(message, name));
+  if (!value) return std::nullopt;
+  return stdString(value);
+}
+
+std::string base64(const uint8_t* data, size_t len) {
+  NSData* bytes = [NSData dataWithBytes:data length:len];
+  return stdString([bytes base64EncodedStringWithOptions:0]);
+}
+
+std::string acceptKey(const std::string& key) {
+  const std::string input = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  uint8_t digest[CC_SHA1_DIGEST_LENGTH];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  CC_SHA1(input.data(), static_cast<CC_LONG>(input.size()), digest);
+#pragma clang diagnostic pop
+  return base64(digest, sizeof(digest));
+}
+
+const std::string& userAgent() {
+  static const std::string agent = [] {
+    NSCharacterSet* allowed = [NSCharacterSet characterSetWithCharactersInString:
+      @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!$&'*+-._~"];
+    NSBundle* main = NSBundle.mainBundle;
+    NSString* name = [main objectForInfoDictionaryKey:(__bridge NSString*)kCFBundleNameKey];
+    if (name.length == 0) name = NSProcessInfo.processInfo.processName;
+    NSString* product = [name stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: name;
+    NSString* version = [[main objectForInfoDictionaryKey:(__bridge NSString*)kCFBundleVersionKey]
+      stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+    NSString* network = [[NSBundle bundleWithIdentifier:@"com.apple.CFNetwork"]
+      objectForInfoDictionaryKey:(__bridge NSString*)kCFBundleVersionKey];
+    struct utsname system;
+    uname(&system);
+    NSString* app = version.length > 0
+      ? [NSString stringWithFormat:@"%@/%@", product, version]
+      : [NSString stringWithFormat:@"%@ (unknown version)", product];
+    return stdString([NSString stringWithFormat:@"%@ CFNetwork/%@ Darwin/%s", app, network, system.release]);
+  }();
+  return agent;
+}
+
+std::string posixDescription(int code) {
+  return stdString([NSError errorWithDomain:NSPOSIXErrorDomain code:code userInfo:nil].localizedDescription);
+}
+
+std::string errorDescription(nw_error_t error, int fallback) {
+  if (error) {
+    CFErrorRef cfError = nw_error_copy_cf_error(error);
+    if (cfError) {
+      NSError* nsError = CFBridgingRelease(cfError);
+      return stdString(nsError.localizedDescription);
+    }
+  }
+  return posixDescription(fallback);
+}
+
+std::string connectErrorDescription(nw_error_t error, NSString* host) {
+  const int code = error ? nw_error_get_error_code(error) : ENOTCONN;
+  const nw_error_domain_t domain = error ? nw_error_get_error_domain(error) : nw_error_domain_posix;
+  if (domain == nw_error_domain_dns) return "A server with the specified hostname could not be found.";
+  if (domain == nw_error_domain_tls) {
+    switch (code) {
+      case errSSLXCertChainInvalid:
+      case errSSLBadCert:
+      case errSSLUnknownRootCert:
+      case errSSLNoRootCert:
+      case errSSLCertExpired:
+      case errSSLCertNotYetValid:
+      case errSSLHostNameMismatch:
+        return "The certificate for this server is invalid. You might be connecting to a server that is pretending to be \u201c" +
+               stdString(host) + "\u201d which could put your confidential information at risk.";
+      default:
+        return "A TLS error caused the secure connection to fail.";
+    }
+  }
+  if (code == ENETDOWN) return "The Internet connection appears to be offline.";
+  if (code == ETIMEDOUT) return "The request timed out.";
+  return "Could not connect to the server.";
+}
+
+bool isAllowedScheme(NSString* scheme) {
+  NSString* lower = scheme.lowercaseString;
+  return [lower isEqualToString:@"ws"] || [lower isEqualToString:@"wss"] ||
+         [lower isEqualToString:@"http"] || [lower isEqualToString:@"https"];
+}
+
+bool isValidTarget(NSURL* url) {
+  if (!url || !isAllowedScheme(url.scheme) || url.host.length == 0) return false;
+  return !url.port || (url.port.integerValue > 0 && url.port.integerValue <= 65535);
+}
+
+bool isSecureScheme(NSString* scheme) {
+  NSString* lower = scheme.lowercaseString;
+  return [lower isEqualToString:@"wss"] || [lower isEqualToString:@"https"];
+}
+
+NSURL* cookieURL(NSURL* url) {
+  NSURLComponents* components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:YES];
+  components.scheme = isSecureScheme(url.scheme) ? @"https" : @"http";
+  return components.URL;
+}
+
+bool isValidCloseCode(int code) {
+  return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999);
+}
+
+std::string closePayload(int code, const std::string& reason) {
+  size_t len = std::min<size_t>(reason.size(), 123);
+  while (len > 0 && len < reason.size() && (static_cast<uint8_t>(reason[len]) & 0xC0) == 0x80) len--;
+  std::string payload;
+  payload.reserve(2 + len);
+  payload.push_back(static_cast<char>((code >> 8) & 0xFF));
+  payload.push_back(static_cast<char>(code & 0xFF));
+  payload.append(reason, 0, len);
+  return payload;
+}
+
+void maskInto(uint8_t* dst, const uint8_t* src, size_t len, const uint8_t key[4]) {
+  uint32_t key32;
+  std::memcpy(&key32, key, 4);
+  const uint64_t key64 = (static_cast<uint64_t>(key32) << 32) | key32;
+  size_t i = 0;
+  for (; i + 8 <= len; i += 8) {
+    uint64_t chunk;
+    std::memcpy(&chunk, src + i, 8);
+    chunk ^= key64;
+    std::memcpy(dst + i, &chunk, 8);
+  }
+  for (; i < len; i++) dst[i] = src[i] ^ key[i & 3];
+}
+
+dispatch_data_t makeFrame(uint8_t first, const uint8_t* payload, size_t len) {
+  const size_t header = len < 126 ? 6 : (len <= 0xFFFF ? 8 : 14);
+  auto* frame = static_cast<uint8_t*>(malloc(header + len));
+  frame[0] = first;
+  size_t pos;
+  if (len < 126) {
+    frame[1] = static_cast<uint8_t>(0x80 | len);
+    pos = 2;
+  } else if (len <= 0xFFFF) {
+    frame[1] = 0x80 | 126;
+    frame[2] = static_cast<uint8_t>(len >> 8);
+    frame[3] = static_cast<uint8_t>(len);
+    pos = 4;
+  } else {
+    frame[1] = 0x80 | 127;
+    for (int i = 0; i < 8; i++) frame[2 + i] = static_cast<uint8_t>(static_cast<uint64_t>(len) >> (56 - 8 * i));
+    pos = 10;
+  }
+  uint8_t key[4];
+  arc4random_buf(key, sizeof(key));
+  std::memcpy(frame + pos, key, 4);
+  maskInto(frame + pos + 4, payload, len, key);
+  return dispatch_data_create(frame, header + len, nullptr, DISPATCH_DATA_DESTRUCTOR_FREE);
+}
+
+dispatch_data_t makeData(const std::string& bytes) {
+  return dispatch_data_create(bytes.data(), bytes.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+}
+
+} // namespace
 
 struct NWWebSocketConnection::Impl {
-  NSURLSession* session = nil;
-  NSURLSessionWebSocketTask* task = nil;
-  NWWSDelegate* delegate = nil;
-  // Cached once at connect() — avoids shared_from_this() + weak_ptr construction
-  // on every scheduleReceive() call (every received message).
-  std::weak_ptr<WebSocketConnectionBase> selfWeak;
+  explicit Impl(NWWebSocketConnection* owner) : owner(owner) {
+    dispatch_queue_attr_t attributes =
+      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+    queue = dispatch_queue_create("com.margelo.nitro.websockets.connection", attributes);
+  }
+
+  ~Impl() {
+    if (connection) nw_connection_force_cancel(connection);
+    releaseCompression();
+  }
+
+  NWWebSocketConnection* owner;
+  dispatch_queue_t queue;
+  std::weak_ptr<WebSocketConnectionBase> weakSelf;
+  std::shared_ptr<WebSocketConnectionBase> selfRef;
+  nw_connection_t connection = nil;
+  uint64_t timerGeneration = 0;
+  bool connected = false;
+
+  NSURL* url = nil;
+  Fields extraHeaders;
+  std::string requestedProtocols;
+  std::string key;
+  std::string offeredProtocols;
+  std::string offeredExtensions;
+  std::vector<uint8_t> handshake;
+  int redirects = 0;
+  bool open = false;
+
+  std::vector<uint8_t> pendingFrame;
+  std::vector<uint8_t> message;
+  size_t streamRemaining = 0;
+  bool streamFin = false;
+  bool inMessage = false;
+  bool messageBinary = false;
+  bool messageCompressed = false;
+
+  bool perMessageDeflate = false;
+  bool serverNoContextTakeover = false;
+  bool clientNoContextTakeover = false;
+  int clientWindowBits = MAX_WBITS;
+  z_stream* inflater = nullptr;
+  z_stream* deflater = nullptr;
+
+  bool closeSent = false;
+  bool localClose = false;
+  bool stopped = false;
+  bool finished = false;
+  int closeCode = 0;
+  std::string closeReason;
+  std::optional<std::string> failure;
+
+  OnOpen onOpen;
+  OnMessage onMessage;
+  OnClose onClose;
+  OnError onError;
+  bool openPending = false;
+  std::deque<BufferedMessage> buffered;
+
+#if defined(NITRO_WS_TRACING)
+  os_signpost_id_t signpost = OS_SIGNPOST_ID_NULL;
+#endif
+
+  static Impl* from(const std::shared_ptr<WebSocketConnectionBase>& self) {
+    return static_cast<NWWebSocketConnection*>(self.get())->_impl.get();
+  }
+
+  void begin(const std::shared_ptr<WebSocketConnectionBase>& self, NSURL* target,
+             const std::string& protocols, const Fields& headers) {
+    if (finished) return;
+    weakSelf = self;
+    requestedProtocols = protocols;
+    extraHeaders = headers;
+    if (owner->_state.load(std::memory_order_acquire) != State::CONNECTING) return;
+    if (!isValidTarget(target)) {
+      finish(1006, "", false, "Invalid WebSocket URL: " + owner->url());
+      return;
+    }
+    start(target);
+  }
+
+  void start(NSURL* target) {
+    url = target;
+    connected = false;
+    handshake.clear();
+    const bool secure = isSecureScheme(target.scheme);
+    const int port = target.port ? target.port.intValue : (secure ? 443 : 80);
+    nw_endpoint_t endpoint = nw_endpoint_create_host(target.host.UTF8String, std::to_string(port).c_str());
+    nw_parameters_t parameters = nw_parameters_create_secure_tcp(
+      secure ? NW_PARAMETERS_DEFAULT_CONFIGURATION : NW_PARAMETERS_DISABLE_PROTOCOL,
+      ^(nw_protocol_options_t options) {
+        nw_tcp_options_set_no_delay(options, true);
+      });
+    nw_connection_t created = nw_connection_create(endpoint, parameters);
+    connection = created;
+    nw_connection_set_queue(created, queue);
+    auto weak = weakSelf;
+    nw_connection_set_state_changed_handler(created, ^(nw_connection_state_t state, nw_error_t error) {
+      auto strong = weak.lock();
+      if (!strong) return;
+      Impl* impl = from(strong);
+      if (impl->connection != created || impl->finished) return;
+      if (state == nw_connection_state_ready) {
+        impl->connected = true;
+        impl->sendHandshake();
+        impl->readHandshake();
+      } else if (state == nw_connection_state_waiting || state == nw_connection_state_failed) {
+        impl->transportFailed(error);
+      }
+    });
+    armTimer(kHandshakeTimeout);
+    nw_connection_start(created);
+  }
+
+  void sendHandshake() {
+    uint8_t nonce[16];
+    arc4random_buf(nonce, sizeof(nonce));
+    const bool secure = isSecureScheme(url.scheme);
+    std::string host = stdString(url.host);
+    if (host.find(':') != std::string::npos) host = "[" + host + "]";
+    if (url.port && url.port.intValue != (secure ? 443 : 80)) host += ":" + std::to_string(url.port.intValue);
+
+    Fields fields = {
+      { "Host", host },
+      { "Upgrade", "websocket" },
+      { "Connection", "Upgrade" },
+      { "Sec-WebSocket-Key", base64(nonce, sizeof(nonce)) },
+      { "Sec-WebSocket-Version", "13" },
+    };
+    if (!requestedProtocols.empty()) fields.emplace_back("Sec-WebSocket-Protocol", requestedProtocols);
+    fields.emplace_back("Sec-WebSocket-Extensions", "permessage-deflate");
+    NSMutableArray<NSHTTPCookie*>* cookies = [NSMutableArray array];
+    for (NSHTTPCookie* stored in [NSHTTPCookieStorage.sharedHTTPCookieStorage cookiesForURL:cookieURL(url)]) {
+      if (secure || !stored.isSecure) [cookies addObject:stored];
+    }
+    NSString* cookie = [NSHTTPCookie requestHeaderFieldsWithCookies:cookies][@"Cookie"];
+    if (cookie.length > 0) fields.emplace_back("Cookie", stdString(cookie));
+    fields.emplace_back("User-Agent", userAgent());
+    for (const auto& [name, value] : extraHeaders) {
+      if (name.empty() || name.find_first_of(":\r\n") != std::string::npos ||
+          value.find_first_of("\r\n") != std::string::npos) {
+        continue;
+      }
+      setField(fields, name, value);
+    }
+
+    const std::string* sentKey = findField(fields, "Sec-WebSocket-Key");
+    key = sentKey ? *sentKey : std::string();
+    const std::string* sentProtocols = findField(fields, "Sec-WebSocket-Protocol");
+    offeredProtocols = sentProtocols ? *sentProtocols : std::string();
+    const std::string* sentExtensions = findField(fields, "Sec-WebSocket-Extensions");
+    offeredExtensions = sentExtensions ? *sentExtensions : std::string();
+
+    NSURLComponents* components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:YES];
+    std::string target = stdString(components.percentEncodedPath);
+    if (target.empty()) target = "/";
+    if (components.percentEncodedQuery) target += "?" + stdString(components.percentEncodedQuery);
+
+    std::string request = "GET " + target + " HTTP/1.1\r\n";
+    for (const auto& [name, value] : fields) request += name + ": " + value + "\r\n";
+    request += "\r\n";
+    nw_connection_send(connection, makeData(request), NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true,
+                       ^(nw_error_t) {});
+  }
+
+  void readHandshake() {
+    nw_connection_t current = connection;
+    auto weak = weakSelf;
+    nw_connection_receive(current, 1, kReadSize,
+      ^(dispatch_data_t content, nw_content_context_t context, bool isComplete, nw_error_t error) {
+        auto strong = weak.lock();
+        if (!strong) return;
+        Impl* impl = from(strong);
+        if (impl->connection != current || impl->finished) return;
+        if (content) {
+          const size_t searched = impl->handshake.size() < 3 ? 0 : impl->handshake.size() - 3;
+          dispatch_data_apply(content, ^bool(dispatch_data_t, size_t, const void* buffer, size_t size) {
+            const auto* bytes = static_cast<const uint8_t*>(buffer);
+            impl->handshake.insert(impl->handshake.end(), bytes, bytes + size);
+            return true;
+          });
+          static constexpr uint8_t kEnd[] = { '\r', '\n', '\r', '\n' };
+          auto end = std::search(impl->handshake.begin() + static_cast<std::ptrdiff_t>(searched), impl->handshake.end(),
+                                 std::begin(kEnd), std::end(kEnd));
+          const size_t headerSize = end == impl->handshake.end()
+            ? impl->handshake.size()
+            : static_cast<size_t>(end - impl->handshake.begin()) + sizeof(kEnd);
+          if (headerSize > kMaxHandshakeSize) {
+            impl->finish(1006, "", false, "There was a bad response from the server.");
+            return;
+          }
+          if (end != impl->handshake.end()) {
+            impl->handshakeReceived(headerSize);
+            return;
+          }
+        }
+        if (error || (isComplete && (!context || nw_content_context_get_is_final(context)))) {
+          impl->transportFailed(error);
+          return;
+        }
+        impl->readHandshake();
+      });
+  }
+
+  void handshakeReceived(size_t headerSize) {
+    CFHTTPMessageRef response = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, false);
+    CFHTTPMessageAppendBytes(response, handshake.data(), static_cast<CFIndex>(headerSize));
+    std::vector<uint8_t> leftover(handshake.begin() + static_cast<std::ptrdiff_t>(headerSize), handshake.end());
+    handshake.clear();
+    handshake.shrink_to_fit();
+    if (!CFHTTPMessageIsHeaderComplete(response)) {
+      CFRelease(response);
+      finish(1006, "", false, "There was a bad response from the server.");
+      return;
+    }
+
+    const CFIndex status = CFHTTPMessageGetResponseStatusCode(response);
+    NSString* setCookie = CFBridgingRelease(CFHTTPMessageCopyHeaderFieldValue(response, CFSTR("Set-Cookie")));
+    if (setCookie.length > 0) {
+      NSURL* storageURL = cookieURL(url);
+      NSArray<NSHTTPCookie*>* cookies =
+        [NSHTTPCookie cookiesWithResponseHeaderFields:@{ @"Set-Cookie": setCookie } forURL:storageURL];
+      [NSHTTPCookieStorage.sharedHTTPCookieStorage setCookies:cookies forURL:storageURL mainDocumentURL:nil];
+    }
+
+    const auto location = headerValue(response, CFSTR("Location"));
+    const auto upgrade = headerValue(response, CFSTR("Upgrade"));
+    const auto connectionHeader = headerValue(response, CFSTR("Connection"));
+    const auto accept = headerValue(response, CFSTR("Sec-WebSocket-Accept"));
+    const auto protocol = headerValue(response, CFSTR("Sec-WebSocket-Protocol"));
+    const auto extensions = headerValue(response, CFSTR("Sec-WebSocket-Extensions"));
+    CFRelease(response);
+
+    if ((status == 301 || status == 302 || status == 303 || status == 307 || status == 308) && location) {
+      redirect(*location);
+      return;
+    }
+    const std::string badResponse = "There was a bad response from the server.";
+    if (status != 101 || !upgrade || !equalsIgnoreCase(trim(*upgrade), "websocket") ||
+        !connectionHeader || !hasToken(*connectionHeader, "upgrade") ||
+        !accept || std::string(trim(*accept)) != acceptKey(key)) {
+      finish(1006, "", false, badResponse);
+      return;
+    }
+
+    std::string negotiatedProtocol;
+    if (protocol && !trim(*protocol).empty()) {
+      negotiatedProtocol = std::string(trim(*protocol));
+      bool offered = false;
+      for (auto candidate : split(offeredProtocols, ',')) {
+        if (candidate == negotiatedProtocol) offered = true;
+      }
+      if (!offered) {
+        finish(1006, "", false, badResponse);
+        return;
+      }
+    }
+    std::string negotiatedExtensions;
+    if (extensions && !trim(*extensions).empty()) {
+      negotiatedExtensions = std::string(trim(*extensions));
+      if (!configureDeflate(negotiatedExtensions)) {
+        finish(1006, "", false, badResponse);
+        return;
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(owner->_strMu);
+      owner->_negotiatedProtocol = negotiatedProtocol;
+      owner->_extensions = negotiatedExtensions;
+    }
+    {
+      std::lock_guard<std::mutex> lock(owner->_sendMu);
+      if (owner->_state.load(std::memory_order_acquire) != State::CONNECTING) return;
+      owner->_state.store(State::OPEN, std::memory_order_release);
+    }
+    open = true;
+    cancelTimer();
+#if defined(NITRO_WS_TRACING)
+    os_signpost_interval_end(nitroWsLog(), signpost, "NitroWS", "connected");
+#endif
+    if (onOpen) {
+      onOpen();
+    } else {
+      openPending = true;
+    }
+    if (!leftover.empty()) consume(leftover.data(), leftover.size());
+    if (!stopped) readFrames();
+  }
+
+  bool configureDeflate(const std::string& response) {
+    bool offered = false;
+    for (auto offer : split(offeredExtensions, ',')) {
+      if (equalsIgnoreCase(split(offer, ';')[0], "permessage-deflate")) offered = true;
+    }
+    auto accepted = split(response, ',');
+    if (!offered || accepted.size() != 1) return false;
+    auto params = split(accepted[0], ';');
+    if (!equalsIgnoreCase(params[0], "permessage-deflate")) return false;
+    bool seenServerNoContext = false;
+    bool seenClientNoContext = false;
+    bool seenServerBits = false;
+    bool seenClientBits = false;
+    for (size_t i = 1; i < params.size(); i++) {
+      const size_t eq = params[i].find('=');
+      auto name = trim(params[i].substr(0, eq));
+      std::string_view value = eq == std::string_view::npos ? std::string_view() : trim(params[i].substr(eq + 1));
+      if (value.size() >= 2 && value.front() == '"' && value.back() == '"') value = value.substr(1, value.size() - 2);
+      auto bits = [&value]() -> int {
+        if (value.empty() || value.size() > 2) return 0;
+        int parsed = 0;
+        for (char c : value) {
+          if (c < '0' || c > '9') return 0;
+          parsed = parsed * 10 + (c - '0');
+        }
+        return parsed >= 8 && parsed <= 15 ? parsed : 0;
+      };
+      if (equalsIgnoreCase(name, "server_no_context_takeover") && eq == std::string_view::npos && !seenServerNoContext) {
+        seenServerNoContext = true;
+        serverNoContextTakeover = true;
+      } else if (equalsIgnoreCase(name, "client_no_context_takeover") && eq == std::string_view::npos && !seenClientNoContext) {
+        seenClientNoContext = true;
+        clientNoContextTakeover = true;
+      } else if (equalsIgnoreCase(name, "server_max_window_bits") && !seenServerBits && bits() != 0) {
+        seenServerBits = true;
+      } else if (equalsIgnoreCase(name, "client_max_window_bits") && !seenClientBits && bits() != 0) {
+        seenClientBits = true;
+        clientWindowBits = bits();
+      } else {
+        return false;
+      }
+    }
+    perMessageDeflate = true;
+    return true;
+  }
+
+  void redirect(const std::string& location) {
+    if (++redirects > kMaxRedirects) {
+      finish(1006, "", false, "too many HTTP redirects");
+      return;
+    }
+    NSString* target = [[NSString alloc] initWithBytes:location.data() length:location.size() encoding:NSUTF8StringEncoding];
+    NSURL* next = target ? [NSURL URLWithString:target relativeToURL:url].absoluteURL : nil;
+    if (!isValidTarget(next)) {
+      finish(1006, "", false, "There was a bad response from the server.");
+      return;
+    }
+    extraHeaders.erase(std::remove_if(extraHeaders.begin(), extraHeaders.end(),
+                                      [](const auto& field) { return equalsIgnoreCase(field.first, "Authorization"); }),
+                       extraHeaders.end());
+    nw_connection_cancel(connection);
+    start(next);
+  }
+
+  void readFrames() {
+    nw_connection_t current = connection;
+    auto weak = weakSelf;
+    nw_connection_receive(current, 1, kReadSize,
+      ^(dispatch_data_t content, nw_content_context_t context, bool isComplete, nw_error_t error) {
+        auto strong = weak.lock();
+        if (!strong) return;
+        Impl* impl = from(strong);
+        if (impl->stopped) return;
+        if (content) {
+          dispatch_data_apply(content, ^bool(dispatch_data_t, size_t, const void* buffer, size_t size) {
+            impl->consume(static_cast<const uint8_t*>(buffer), size);
+            return !impl->stopped;
+          });
+          if (impl->stopped) return;
+        }
+        if (error) {
+          impl->transportFailed(error);
+        } else if (isComplete && (!context || nw_content_context_get_is_final(context))) {
+          impl->transportClosed();
+        } else {
+          impl->readFrames();
+        }
+      });
+  }
+
+  void consume(const uint8_t* data, size_t size) {
+    while (size > 0 && !stopped) {
+      if (streamRemaining > 0) {
+        const size_t take = std::min(size, streamRemaining);
+        message.insert(message.end(), data, data + take);
+        data += take;
+        size -= take;
+        streamRemaining -= take;
+        if (streamRemaining == 0 && streamFin) finishMessage();
+        continue;
+      }
+      if (!pendingFrame.empty()) {
+        size_t needed;
+        while ((needed = pendingFrameNeeds()) > 0 && size > 0) {
+          const size_t take = std::min(size, needed);
+          pendingFrame.insert(pendingFrame.end(), data, data + take);
+          data += take;
+          size -= take;
+        }
+        if (needed > 0) return;
+        parseFrames(pendingFrame.data(), pendingFrame.size());
+        if (stopped) return;
+        pendingFrame.clear();
+        continue;
+      }
+      const size_t used = parseFrames(data, size);
+      if (stopped) return;
+      data += used;
+      size -= used;
+      if (size > 0 && streamRemaining == 0) {
+        pendingFrame.assign(data, data + size);
+        return;
+      }
+    }
+  }
+
+  size_t pendingFrameNeeds() const {
+    const size_t have = pendingFrame.size();
+    if (have < 2) return 2 - have;
+    const uint8_t length = pendingFrame[1] & 0x7F;
+    const size_t header = length == 126 ? 4 : (length == 127 ? 10 : 2);
+    if (have < header) return header - have;
+    if (!(pendingFrame[0] & 0x08) || length > 125) return 0;
+    return header + length > have ? header + length - have : 0;
+  }
+
+  size_t parseFrames(const uint8_t* data, size_t size) {
+    size_t offset = 0;
+    while (!stopped && size - offset >= 2) {
+      const uint8_t* frame = data + offset;
+      const size_t available = size - offset;
+      const bool fin = frame[0] & kFin;
+      const bool compressed = frame[0] & kRsv1;
+      const uint8_t opcode = frame[0] & 0x0F;
+      size_t header = 2;
+      uint64_t length = frame[1] & 0x7F;
+      if (length == 126) {
+        if (available < 4) break;
+        length = (static_cast<uint64_t>(frame[2]) << 8) | frame[3];
+        header = 4;
+      } else if (length == 127) {
+        if (available < 10) break;
+        length = 0;
+        for (int i = 0; i < 8; i++) length = (length << 8) | frame[2 + i];
+        header = 10;
+      }
+      if ((frame[1] & 0x80) || (frame[0] & 0x30)) {
+        fail(1002, EPROTO);
+        break;
+      }
+      if (opcode & 0x08) {
+        if (!fin || compressed || length > 125 || opcode > kOpPong) {
+          fail(1002, EPROTO);
+          break;
+        }
+        if (available < header + length) break;
+        controlFrame(opcode, frame + header, static_cast<size_t>(length));
+        offset += header + static_cast<size_t>(length);
+        continue;
+      }
+      if (opcode > kOpBinary || (opcode == kOpContinuation ? (!inMessage || compressed) : inMessage) ||
+          (compressed && !perMessageDeflate)) {
+        fail(1002, EPROTO);
+        break;
+      }
+      const size_t base = opcode == kOpContinuation ? message.size() : 0;
+      if (length > kMaxMessageSize - base) {
+        fail(1009, EMSGSIZE);
+        break;
+      }
+      if (opcode != kOpContinuation) {
+        messageBinary = opcode == kOpBinary;
+        messageCompressed = compressed;
+      }
+      const size_t len = static_cast<size_t>(length);
+      if (available - header >= len) {
+        dataFrame(opcode, fin, frame + header, len);
+        offset += header + len;
+        continue;
+      }
+      if (opcode != kOpContinuation) {
+        message.clear();
+        inMessage = true;
+      }
+      message.reserve(message.size() + len);
+      message.insert(message.end(), frame + header, data + size);
+      streamRemaining = len - (available - header);
+      streamFin = fin;
+      return size;
+    }
+    return offset;
+  }
+
+  void dataFrame(uint8_t opcode, bool fin, const uint8_t* payload, size_t len) {
+    if (opcode != kOpContinuation && fin && !messageCompressed) {
+      if (!messageBinary && !isWellFormedUtf8(payload, len)) {
+        fail(1007, EPROTO);
+        return;
+      }
+      deliver(payload, len, messageBinary, nullptr);
+      return;
+    }
+    if (opcode != kOpContinuation) {
+      message.assign(payload, payload + len);
+      inMessage = true;
+    } else {
+      message.insert(message.end(), payload, payload + len);
+    }
+    if (fin) finishMessage();
+  }
+
+  void finishMessage() {
+    inMessage = false;
+    std::vector<uint8_t> data = std::move(message);
+    message = std::vector<uint8_t>();
+    if (messageCompressed) {
+      std::vector<uint8_t> inflated;
+      if (!inflateMessage(data.data(), data.size(), inflated)) return;
+      data = std::move(inflated);
+    }
+    if (!messageBinary && !isWellFormedUtf8(data.data(), data.size())) {
+      fail(1007, EPROTO);
+      return;
+    }
+    deliver(data.data(), data.size(), messageBinary, &data);
+  }
+
+  void deliver(const uint8_t* data, size_t len, bool isBinary, std::vector<uint8_t>* owned) {
+    if (localClose) return;
+#if defined(NITRO_WS_TRACING)
+    os_signpost_event_emit(nitroWsLog(), signpost, "NitroWS", "receive %s %zu bytes", isBinary ? "binary" : "text", len);
+#endif
+    if (onMessage) {
+      onMessage(data, len, isBinary);
+      return;
+    }
+    buffered.push_back({ owned ? std::move(*owned) : std::vector<uint8_t>(data, data + len), isBinary });
+  }
+
+  void controlFrame(uint8_t opcode, const uint8_t* payload, size_t len) {
+    if (opcode == kOpPing) {
+      if (!closeSent) sendFrame(makeFrame(kFin | kOpPong, payload, len));
+      return;
+    }
+    if (opcode != kOpClose) return;
+
+    int code = 1005;
+    std::string reason;
+    if (len == 1) {
+      fail(1002, EPROTO);
+      return;
+    }
+    if (len >= 2) {
+      code = (payload[0] << 8) | payload[1];
+      if (!isValidCloseCode(code)) {
+        fail(1002, EPROTO);
+        return;
+      }
+      if (!isWellFormedUtf8(payload + 2, len - 2)) {
+        fail(1007, EPROTO);
+        return;
+      }
+      reason.assign(reinterpret_cast<const char*>(payload + 2), len - 2);
+    }
+    stopped = true;
+    if (closeSent) {
+      finish(closeCode, closeReason, true, std::nullopt);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(owner->_sendMu);
+      State expected = State::OPEN;
+      owner->_state.compare_exchange_strong(expected, State::CLOSING, std::memory_order_acq_rel);
+    }
+    closeCode = code;
+    closeReason = reason;
+    closeSent = true;
+    selfRef = weakSelf.lock();
+    const std::string echo = len >= 2 ? closePayload(code, "") : std::string();
+    auto weak = weakSelf;
+    sendFrame(makeFrame(kFin | kOpClose, reinterpret_cast<const uint8_t*>(echo.data()), echo.size()),
+              ^(nw_error_t) {
+                auto strong = weak.lock();
+                if (!strong) return;
+                Impl* impl = from(strong);
+                impl->finish(impl->closeCode, impl->closeReason, true, std::nullopt);
+              });
+  }
+
+  void closeRequested(State previous, int code, const std::string& reason) {
+    if (finished) return;
+    if (previous == State::CONNECTING || !open) {
+      finish(1006, "", false, std::nullopt);
+      return;
+    }
+    if (closeSent) return;
+    localClose = true;
+    closeCode = code;
+    closeReason = reason;
+    closeSent = true;
+    selfRef = weakSelf.lock();
+    const std::string payload = isValidCloseCode(code) ? closePayload(code, reason) : std::string();
+    auto weak = weakSelf;
+    sendFrame(makeFrame(kFin | kOpClose, reinterpret_cast<const uint8_t*>(payload.data()), payload.size()),
+              ^(nw_error_t) {
+                auto strong = weak.lock();
+                if (!strong) return;
+                Impl* impl = from(strong);
+                impl->finish(impl->closeCode, impl->closeReason, true, std::nullopt);
+              });
+  }
+
+  void fail(int code, int posixCode) {
+    if (stopped) return;
+    stopped = true;
+    {
+      std::lock_guard<std::mutex> lock(owner->_sendMu);
+      State current = owner->_state.load(std::memory_order_acquire);
+      if (current == State::CONNECTING || current == State::OPEN) {
+        owner->_state.store(State::CLOSING, std::memory_order_release);
+      }
+    }
+    failure = posixDescription(posixCode);
+    if (closeSent || !open) {
+      finish(1006, "", false, failure);
+      return;
+    }
+    closeSent = true;
+    selfRef = weakSelf.lock();
+    const std::string payload = closePayload(code, "");
+    auto weak = weakSelf;
+    sendFrame(makeFrame(kFin | kOpClose, reinterpret_cast<const uint8_t*>(payload.data()), payload.size()),
+              ^(nw_error_t) {
+                auto strong = weak.lock();
+                if (!strong) return;
+                Impl* impl = from(strong);
+                impl->finish(1006, "", false, impl->failure);
+              });
+  }
+
+  void transportFailed(nw_error_t error) {
+    if (failure) {
+      finish(1006, "", false, failure);
+      return;
+    }
+    if (closeSent) {
+      finish(closeCode, closeReason, true, std::nullopt);
+      return;
+    }
+    if (open) {
+      finish(1006, "", false, errorDescription(error, ENOTCONN));
+    } else if (connected) {
+      finish(1006, "", false, handshake.empty() ? "The network connection was lost." : "cannot parse response");
+    } else {
+      finish(1006, "", false, connectErrorDescription(error, url.host));
+    }
+  }
+
+  void transportClosed() {
+    if (failure) {
+      finish(1006, "", false, failure);
+      return;
+    }
+    if (closeSent) {
+      finish(closeCode, closeReason, true, std::nullopt);
+      return;
+    }
+    finish(1006, "", false, posixDescription(ENOTCONN));
+  }
+
+  void finish(int code, const std::string& reason, bool wasClean, const std::optional<std::string>& error) {
+    if (finished) return;
+    finished = true;
+    stopped = true;
+    cancelTimer();
+    {
+      std::lock_guard<std::mutex> lock(owner->_sendMu);
+      owner->_state.store(State::CLOSED, std::memory_order_release);
+    }
+    if (connection) nw_connection_cancel(connection);
+    releaseCompression();
+    pendingFrame = std::vector<uint8_t>();
+    message = std::vector<uint8_t>();
+#if defined(NITRO_WS_TRACING)
+    os_signpost_event_emit(nitroWsLog(), signpost, "NitroWS", "close code=%d clean=%d", code, wasClean ? 1 : 0);
+#endif
+    if (error && onError) onError(*error);
+    if (onClose) onClose(code, reason, wasClean);
+    auto keepAlive = std::move(selfRef);
+  }
+
+  void sendFrame(dispatch_data_t frame, void (^completion)(nw_error_t) = nil) {
+    nw_connection_send(connection, frame, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(nw_error_t error) {
+      if (completion) completion(error);
+    });
+  }
+
+  void sendData(uint8_t opcode, const std::vector<uint8_t>& payload) {
+    const size_t len = payload.size();
+    if (closeSent || finished) {
+      owner->_bufferedAmount.fetch_sub(len, std::memory_order_relaxed);
+      return;
+    }
+    dispatch_data_t frame = nil;
+    if (len >= kMinDeflateSize && clientWindowBits > 8) {
+      std::vector<uint8_t> compressed;
+      if (!deflateMessage(payload, compressed)) {
+        owner->_bufferedAmount.fetch_sub(len, std::memory_order_relaxed);
+        fail(1011, EPROTO);
+        return;
+      }
+      frame = makeFrame(kFin | kRsv1 | opcode, compressed.data(), compressed.size());
+    } else {
+      frame = makeFrame(kFin | opcode, payload.data(), len);
+    }
+    auto weak = weakSelf;
+    sendFrame(frame, ^(nw_error_t) {
+      if (auto strong = weak.lock()) {
+        static_cast<NWWebSocketConnection*>(strong.get())->_bufferedAmount.fetch_sub(len, std::memory_order_relaxed);
+      }
+    });
+  }
+
+  bool inflateMessage(const uint8_t* data, size_t len, std::vector<uint8_t>& out) {
+    if (!inflater) {
+      inflater = new z_stream();
+      if (inflateInit2(inflater, -MAX_WBITS) != Z_OK) {
+        delete inflater;
+        inflater = nullptr;
+        fail(1011, EPROTO);
+        return false;
+      }
+    }
+    static constexpr uint8_t kTail[] = { 0x00, 0x00, 0xFF, 0xFF };
+    const uint8_t* inputs[] = { data, kTail };
+    const size_t sizes[] = { len, sizeof(kTail) };
+    out.resize(std::min(std::max<size_t>(len * 2, 1024), kMaxMessageSize + 1));
+    size_t produced = 0;
+    bool ended = false;
+    for (int part = 0; part < 2 && !ended; part++) {
+      inflater->next_in = const_cast<Bytef*>(inputs[part]);
+      inflater->avail_in = static_cast<uInt>(sizes[part]);
+      while (inflater->avail_in > 0) {
+        if (produced == out.size()) {
+          if (out.size() > kMaxMessageSize) {
+            fail(1009, EMSGSIZE);
+            return false;
+          }
+          out.resize(std::min(out.size() * 2, kMaxMessageSize + 1));
+        }
+        inflater->next_out = out.data() + produced;
+        inflater->avail_out = static_cast<uInt>(out.size() - produced);
+        const int result = inflate(inflater, Z_SYNC_FLUSH);
+        produced = out.size() - inflater->avail_out;
+        if (result == Z_STREAM_END) {
+          inflateReset(inflater);
+          ended = true;
+          break;
+        }
+        if (result != Z_OK && !(result == Z_BUF_ERROR && inflater->avail_out == 0)) {
+          fail(1007, EPROTO);
+          return false;
+        }
+      }
+    }
+    if (produced > kMaxMessageSize) {
+      fail(1009, EMSGSIZE);
+      return false;
+    }
+    out.resize(produced);
+    if (serverNoContextTakeover && !ended) inflateReset(inflater);
+    return true;
+  }
+
+  bool deflateMessage(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
+    if (!deflater) {
+      deflater = new z_stream();
+      if (deflateInit2(deflater, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -clientWindowBits, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        delete deflater;
+        deflater = nullptr;
+        return false;
+      }
+    }
+    out.resize(deflateBound(deflater, static_cast<uLong>(in.size())) + 16);
+    deflater->next_in = const_cast<Bytef*>(in.data());
+    deflater->avail_in = static_cast<uInt>(in.size());
+    size_t produced = 0;
+    while (true) {
+      deflater->next_out = out.data() + produced;
+      deflater->avail_out = static_cast<uInt>(out.size() - produced);
+      const int result = deflate(deflater, Z_SYNC_FLUSH);
+      if (result != Z_OK && result != Z_BUF_ERROR) return false;
+      produced = out.size() - deflater->avail_out;
+      if (deflater->avail_out > 0) break;
+      out.resize(out.size() * 2);
+    }
+    if (produced < 4) return false;
+    out.resize(produced - 4);
+    if (clientNoContextTakeover) deflateReset(deflater);
+    return true;
+  }
+
+  void releaseCompression() {
+    if (inflater) {
+      inflateEnd(inflater);
+      delete inflater;
+      inflater = nullptr;
+    }
+    if (deflater) {
+      deflateEnd(deflater);
+      delete deflater;
+      deflater = nullptr;
+    }
+  }
+
+  void armTimer(int64_t delay) {
+    const uint64_t generation = ++timerGeneration;
+    auto weak = weakSelf;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), queue, ^{
+      auto strong = weak.lock();
+      if (!strong) return;
+      Impl* impl = from(strong);
+      if (impl->timerGeneration != generation || impl->finished) return;
+      impl->finish(1006, "", false, "The request timed out.");
+    });
+  }
+
+  void cancelTimer() { ++timerGeneration; }
 };
 
 
-// ── Construction / Destruction ───────────────────────────────────────────
-
 NWWebSocketConnection::NWWebSocketConnection()
-  : _impl(std::make_unique<Impl>()) {}
+  : _impl(std::make_unique<Impl>(this)) {}
 
-NWWebSocketConnection::~NWWebSocketConnection() {
-  if (_impl) {
-    if (_impl->task) {
-      [_impl->task cancel];
-      _impl->task = nil;
-    }
-    if (_impl->session) {
-      [_impl->session invalidateAndCancel];
-      _impl->session = nil;
-    }
-    _impl->delegate = nil;
-  }
-}
+NWWebSocketConnection::~NWWebSocketConnection() = default;
 
-
-// ── connect ──────────────────────────────────────────────────────────────
 
 void NWWebSocketConnection::connect(
     const std::string& url,
     const std::vector<std::string>& protocols,
     const std::unordered_map<std::string, std::string>& headers) {
-
   {
     std::lock_guard<std::mutex> lock(_strMu);
     _url = url;
     _negotiatedProtocol.clear();
+    _extensions.clear();
   }
   _state.store(State::CONNECTING, std::memory_order_release);
 
+  NSString* urlString = [[NSString alloc] initWithBytes:url.data() length:url.size() encoding:NSUTF8StringEncoding];
+  NSURL* target = urlString ? [NSURL URLWithString:urlString] : nil;
+  std::string joined;
+  for (size_t i = 0; i < protocols.size(); i++) {
+    if (i > 0) joined += ", ";
+    joined += protocols[i];
+  }
+  Fields fields(headers.begin(), headers.end());
+
+  auto self = shared_from_this();
+  Impl* impl = _impl.get();
 #if defined(NITRO_WS_TRACING)
-  os_signpost_id_t spid = os_signpost_id_generate(nitroWsLog());
-  _signpostId = spid;
-  os_signpost_interval_begin(nitroWsLog(), spid, "NitroWS",
-                              "%{public}s", url.c_str());
+  impl->signpost = os_signpost_id_generate(nitroWsLog());
+  os_signpost_interval_begin(nitroWsLog(), impl->signpost, "NitroWS", "%{public}s", url.c_str());
 #endif
-  _closeFired = false;
-  _openFired = false;
-  _peerCloseCode = 0;
-  _peerCloseReason.clear();
-  _localCloseCode = 0;
-  _localCloseReason.clear();
-
-  if (_impl->task) {
-    [_impl->task cancel];
-    _impl->task = nil;
-  }
-  if (_impl->session) {
-    [_impl->session invalidateAndCancel];
-    _impl->session = nil;
-  }
-
-  NSString* nsUrlStr = [NSString stringWithUTF8String:url.c_str()];
-  NSURL* nsURL = [NSURL URLWithString:nsUrlStr];
-  if (!nsURL) {
-    fireError("Invalid WebSocket URL: " + url);
-    return;
-  }
-
-  NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:nsURL];
-
-  if (!protocols.empty()) {
-    NSMutableArray<NSString*>* arr =
-      [NSMutableArray arrayWithCapacity:protocols.size()];
-    for (const auto& p : protocols) {
-      [arr addObject:[NSString stringWithUTF8String:p.c_str()]];
-    }
-    [request setValue:[arr componentsJoinedByString:@", "]
-        forHTTPHeaderField:@"Sec-WebSocket-Protocol"];
-  }
-
-  for (const auto& [key, value] : headers) {
-    [request setValue:[NSString stringWithUTF8String:value.c_str()]
-        forHTTPHeaderField:[NSString stringWithUTF8String:key.c_str()]];
-  }
-
-  _impl->delegate = [[NWWSDelegate alloc] init];
-
-  NSURLSessionConfiguration* config =
-    [NSURLSessionConfiguration defaultSessionConfiguration];
-  NSOperationQueue* delegateQueue = [[NSOperationQueue alloc] init];
-  delegateQueue.qualityOfService = NSQualityOfServiceUserInteractive;
-  delegateQueue.maxConcurrentOperationCount = 1;
-  _impl->session = [NSURLSession sessionWithConfiguration:config
-                                                 delegate:_impl->delegate
-                                            delegateQueue:delegateQueue];
-
-  _impl->task = [_impl->session webSocketTaskWithRequest:request];
-
-  auto weakSelf =
-    std::weak_ptr<WebSocketConnectionBase>(shared_from_this());
-
-  // ── didOpenWithProtocol ───────────────────────────────────────────
-  _impl->delegate.onOpen = ^(NSString* protocol) {
-    auto strong = weakSelf.lock();
-    if (!strong) return;
-    auto* conn = static_cast<NWWebSocketConnection*>(strong.get());
-
-    conn->_state.store(State::OPEN, std::memory_order_release);
-
-#if defined(NITRO_WS_TRACING)
-    os_signpost_interval_end(nitroWsLog(),
-      static_cast<os_signpost_id_t>(conn->_signpostId),
-      "NitroWS", "connected");
-#endif
-
-    if (protocol.length > 0) {
-      std::lock_guard<std::mutex> lock(conn->_strMu);
-      conn->_negotiatedProtocol = [protocol UTF8String];
-    }
-
-    OnOpen cb;
-    {
-      std::lock_guard<std::mutex> lock(conn->_cbMu);
-      cb = conn->_onOpen;
-    }
-    if (cb) {
-      cb();
-    } else {
-      conn->_openFired.store(true, std::memory_order_release);
-    }
-
-    conn->scheduleReceive();
-  };
-
-  // ── didCloseWithCode (server-initiated close frame) ───────────────
-  _impl->delegate.onServerClose = ^(int code, NSString* reason) {
-    auto strong = weakSelf.lock();
-    if (!strong) return;
-    auto* conn = static_cast<NWWebSocketConnection*>(strong.get());
-
-    conn->_peerCloseCode = code > 0 ? code : 1005;
-    if (reason) {
-      conn->_peerCloseReason = [reason UTF8String];
-    }
-
-    State expected = State::OPEN;
-    conn->_state.compare_exchange_strong(
-      expected, State::CLOSING, std::memory_order_acq_rel);
-  };
-
-  // ── didCompleteWithError (terminal event) ─────────────────────────
-  _impl->delegate.onComplete = ^(NSError* error) {
-    auto strong = weakSelf.lock();
-    if (!strong) return;
-    auto* conn = static_cast<NWWebSocketConnection*>(strong.get());
-
-    State prev = conn->_state.load(std::memory_order_acquire);
-    if (prev == State::CLOSED) return;
-
-    if (conn->_peerCloseCode > 0) {
-      conn->fireClose(conn->_peerCloseCode, conn->_peerCloseReason, true);
-    } else if (conn->_localCloseCode > 0) {
-      conn->fireClose(conn->_localCloseCode, conn->_localCloseReason, true);
-    } else {
-      if (error && error.code != NSURLErrorCancelled) {
-        std::string msg =
-          [[error localizedDescription] UTF8String] ?: "Connection error";
-        conn->fireError(msg);
-      }
-      conn->fireClose(1006, "", false);
-    }
-  };
-
-  _impl->selfWeak = shared_from_this();
-  [_impl->task resume];
+  dispatch_async(impl->queue, ^{
+    impl->begin(self, target, joined, fields);
+  });
 }
 
-
-// ── close ────────────────────────────────────────────────────────────────
 
 void NWWebSocketConnection::close(int code, const std::string& reason) {
-  State expected = State::OPEN;
-  bool wasOpen = _state.compare_exchange_strong(expected, State::CLOSING,
-        std::memory_order_acq_rel);
-  if (!wasOpen) {
-    if (expected == State::CONNECTING) {
-      _state.store(State::CLOSING, std::memory_order_release);
-    } else {
-      return;
-    }
+  State previous;
+  {
+    std::lock_guard<std::mutex> lock(_sendMu);
+    previous = _state.load(std::memory_order_acquire);
+    if (previous == State::CLOSING || previous == State::CLOSED) return;
+    _state.store(State::CLOSING, std::memory_order_release);
   }
-
-  int closeCode = (code >= 1000 && code <= 4999) ? code : 1000;
-  // Mid-handshake there is no close handshake to complete, so the close event
-  // has to report 1006/not-clean rather than the requested code.
-  if (wasOpen) {
-    _localCloseCode = closeCode;
-    _localCloseReason = reason;
-  }
-
-  if (!_impl->task) return;
-
-  NSData* reasonData = nil;
-  if (!reason.empty()) {
-    reasonData = [NSData dataWithBytes:reason.c_str() length:reason.size()];
-  }
-
-  [_impl->task
-    cancelWithCloseCode:static_cast<NSURLSessionWebSocketCloseCode>(closeCode)
-                 reason:reasonData];
+  const int closeCode = (code >= 1000 && code <= 4999) ? code : 1000;
+  std::string closeReason = reason;
+  auto self = shared_from_this();
+  Impl* impl = _impl.get();
+  dispatch_async(impl->queue, ^{
+    (void)self;
+    impl->closeRequested(previous, closeCode, closeReason);
+  });
 }
 
 
-// ── send / sendBinary ────────────────────────────────────────────────────
-
 void NWWebSocketConnection::send(const std::string& data) {
-  if (_state.load(std::memory_order_acquire) != State::OPEN) return;
-  if (!_impl->task) return;
-
-#if defined(NITRO_WS_TRACING)
-  os_signpost_event_emit(nitroWsLog(),
-    static_cast<os_signpost_id_t>(_signpostId),
-    "NitroWS", "send text %zu bytes", data.size());
-#endif
-
-  size_t len = data.size();
-  _bufferedAmount.fetch_add(len, std::memory_order_relaxed);
-
-  NSString* nsStr = [[NSString alloc] initWithBytes:data.c_str()
-                                             length:len
-                                           encoding:NSUTF8StringEncoding];
-  NSURLSessionWebSocketMessage* msg =
-    [[NSURLSessionWebSocketMessage alloc] initWithString:nsStr];
-
-  auto weakSelf =
-    std::weak_ptr<WebSocketConnectionBase>(shared_from_this());
-
-  [_impl->task sendMessage:msg completionHandler:^(NSError* error) {
-    auto strong = weakSelf.lock();
-    if (!strong) return;
-    auto* conn = static_cast<NWWebSocketConnection*>(strong.get());
-
-    conn->_bufferedAmount.fetch_sub(len, std::memory_order_relaxed);
-    if (error) {
-      conn->fireError(
-        [[error localizedDescription] UTF8String] ?: "Send failed");
-    }
-  }];
+  sendMessage(kOpText, reinterpret_cast<const uint8_t*>(data.data()), data.size());
 }
 
 void NWWebSocketConnection::sendBinary(const uint8_t* data, size_t len) {
+  sendMessage(kOpBinary, data, len);
+}
+
+void NWWebSocketConnection::sendMessage(uint8_t opcode, const uint8_t* data, size_t len) {
   if (_state.load(std::memory_order_acquire) != State::OPEN) return;
-  if (!_impl->task) return;
-
+  Impl* impl = _impl.get();
 #if defined(NITRO_WS_TRACING)
-  os_signpost_event_emit(nitroWsLog(),
-    static_cast<os_signpost_id_t>(_signpostId),
-    "NitroWS", "send binary %zu bytes", len);
+  os_signpost_event_emit(nitroWsLog(), impl->signpost, "NitroWS", "send %s %zu bytes",
+                         opcode == kOpText ? "text" : "binary", len);
 #endif
 
-  _bufferedAmount.fetch_add(len, std::memory_order_relaxed);
-
-  NSData* nsData = [NSData dataWithBytes:data length:len];
-  NSURLSessionWebSocketMessage* msg =
-    [[NSURLSessionWebSocketMessage alloc] initWithData:nsData];
-
-  auto weakSelf =
-    std::weak_ptr<WebSocketConnectionBase>(shared_from_this());
-
-  [_impl->task sendMessage:msg completionHandler:^(NSError* error) {
-    auto strong = weakSelf.lock();
-    if (!strong) return;
-    auto* conn = static_cast<NWWebSocketConnection*>(strong.get());
-
-    conn->_bufferedAmount.fetch_sub(len, std::memory_order_relaxed);
-    if (error) {
-      conn->fireError(
-        [[error localizedDescription] UTF8String] ?: "Send binary failed");
+  if (impl->perMessageDeflate) {
+    auto payload = std::make_shared<std::vector<uint8_t>>(data, data + len);
+    {
+      std::lock_guard<std::mutex> lock(_sendMu);
+      if (_state.load(std::memory_order_relaxed) != State::OPEN) return;
+      _bufferedAmount.fetch_add(len, std::memory_order_relaxed);
     }
-  }];
+    auto self = shared_from_this();
+    dispatch_async(impl->queue, ^{
+      (void)self;
+      impl->sendData(opcode, *payload);
+    });
+    return;
+  }
+
+  dispatch_data_t frame = makeFrame(kFin | opcode, data, len);
+  std::weak_ptr<WebSocketConnectionBase> weak = weak_from_this();
+  std::lock_guard<std::mutex> lock(_sendMu);
+  if (_state.load(std::memory_order_relaxed) != State::OPEN) return;
+  _bufferedAmount.fetch_add(len, std::memory_order_relaxed);
+  nw_connection_send(impl->connection, frame, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true, ^(nw_error_t) {
+    if (auto strong = weak.lock()) {
+      static_cast<NWWebSocketConnection*>(strong.get())->_bufferedAmount.fetch_sub(len, std::memory_order_relaxed);
+    }
+  });
 }
 
-
-// ── Receive loop ─────────────────────────────────────────────────────────
-
-void NWWebSocketConnection::scheduleReceive() {
-  if (!_impl->task) return;
-  State s = _state.load(std::memory_order_acquire);
-  if (s == State::CLOSED || s == State::CLOSING) return;
-
-  // Use the cached weak_ptr — avoids shared_from_this() + weak_ptr
-  // construction overhead on every received message.
-  auto weakSelf = _impl->selfWeak;
-
-  [_impl->task receiveMessageWithCompletionHandler:
-    ^(NSURLSessionWebSocketMessage* message, NSError* error) {
-      auto strong = weakSelf.lock();
-      if (!strong) return;
-      auto* conn = static_cast<NWWebSocketConnection*>(strong.get());
-
-      if (error) return;
-      if (!message) {
-        conn->scheduleReceive();
-        return;
-      }
-
-      OnMessage onMsg;
-      {
-        std::lock_guard<std::mutex> lock(conn->_cbMu);
-        onMsg = conn->_onMessage;
-      }
-
-#if defined(NITRO_WS_TRACING)
-      os_signpost_event_emit(nitroWsLog(),
-        static_cast<os_signpost_id_t>(conn->_signpostId),
-        "NitroWS", "receive %s",
-        message.type == NSURLSessionWebSocketMessageTypeString ? "text" : "binary");
-#endif
-
-      switch (message.type) {
-        case NSURLSessionWebSocketMessageTypeString: {
-          NSData* utf8 =
-            [message.string dataUsingEncoding:NSUTF8StringEncoding];
-          if (!utf8) {
-            conn->scheduleReceive();
-            return;
-          }
-          const auto* bytes = static_cast<const uint8_t*>(utf8.bytes);
-          size_t len = utf8.length;
-
-          if (onMsg) {
-            onMsg(bytes, len, false);
-          } else {
-            std::vector<uint8_t> copy(bytes, bytes + len);
-            std::lock_guard<std::mutex> lock(conn->_msgMu);
-            conn->_msgBuffer.push_back({std::move(copy), false});
-          }
-          break;
-        }
-
-        case NSURLSessionWebSocketMessageTypeData: {
-          const auto* bytes =
-            static_cast<const uint8_t*>(message.data.bytes);
-          size_t len = message.data.length;
-
-          if (onMsg) {
-            onMsg(bytes, len, true);
-          } else {
-            std::vector<uint8_t> copy(bytes, bytes + len);
-            std::lock_guard<std::mutex> lock(conn->_msgMu);
-            conn->_msgBuffer.push_back({std::move(copy), true});
-          }
-          break;
-        }
-      }
-
-      conn->scheduleReceive();
-    }];
-}
-
-
-// ── Callback setters ─────────────────────────────────────────────────────
 
 void NWWebSocketConnection::setOnOpen(OnOpen cb) {
-  OnOpen toFire;
-  {
-    std::lock_guard<std::mutex> lock(_cbMu);
-    _onOpen = std::move(cb);
-    if (_onOpen && _openFired.exchange(false, std::memory_order_acq_rel)) {
-      toFire = _onOpen;
+  auto self = shared_from_this();
+  Impl* impl = _impl.get();
+  dispatch_async(impl->queue, ^{
+    (void)self;
+    impl->onOpen = cb;
+    if (impl->onOpen && impl->openPending) {
+      impl->openPending = false;
+      impl->onOpen();
     }
-  }
-  if (toFire) toFire();
+  });
 }
 
 void NWWebSocketConnection::setOnMessage(OnMessage cb) {
-  std::deque<BufferedMessage> replay;
-  OnMessage onMsg;
-  {
-    std::lock_guard<std::mutex> lock(_cbMu);
-    _onMessage = std::move(cb);
-    onMsg = _onMessage;
-  }
-  if (onMsg) {
-    {
-      std::lock_guard<std::mutex> lock(_msgMu);
-      replay = std::move(_msgBuffer);
+  auto self = shared_from_this();
+  Impl* impl = _impl.get();
+  dispatch_async(impl->queue, ^{
+    (void)self;
+    impl->onMessage = cb;
+    while (impl->onMessage && !impl->buffered.empty()) {
+      BufferedMessage next = std::move(impl->buffered.front());
+      impl->buffered.pop_front();
+      impl->onMessage(next.data.data(), next.data.size(), next.isBinary);
     }
-    for (auto& m : replay) {
-      onMsg(m.data.data(), m.data.size(), m.isBinary);
-    }
-  }
+  });
 }
 
 void NWWebSocketConnection::setOnClose(OnClose cb) {
-  std::lock_guard<std::mutex> lock(_cbMu);
-  _onClose = std::move(cb);
+  auto self = shared_from_this();
+  Impl* impl = _impl.get();
+  dispatch_async(impl->queue, ^{
+    (void)self;
+    impl->onClose = cb;
+  });
 }
 
 void NWWebSocketConnection::setOnError(OnError cb) {
-  std::lock_guard<std::mutex> lock(_cbMu);
-  _onError = std::move(cb);
+  auto self = shared_from_this();
+  Impl* impl = _impl.get();
+  dispatch_async(impl->queue, ^{
+    (void)self;
+    impl->onError = cb;
+  });
 }
 
 
-// ── Property getters ─────────────────────────────────────────────────────
-
 std::string NWWebSocketConnection::url() const {
-  std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(_strMu));
+  std::lock_guard<std::mutex> lock(_strMu);
   return _url;
 }
 
 std::string NWWebSocketConnection::protocol() const {
-  std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(_strMu));
+  std::lock_guard<std::mutex> lock(_strMu);
   return _negotiatedProtocol;
 }
 
 std::string NWWebSocketConnection::extensions() const {
-  return "";
+  std::lock_guard<std::mutex> lock(_strMu);
+  return _extensions;
 }
 
-
-// ── Internal helpers ─────────────────────────────────────────────────────
-
-void NWWebSocketConnection::fireClose(
-    int code, const std::string& reason, bool wasClean) {
-  if (_closeFired.exchange(true, std::memory_order_acq_rel)) return;
-  _state.store(State::CLOSED, std::memory_order_release);
-
-#if defined(NITRO_WS_TRACING)
-  os_signpost_event_emit(nitroWsLog(),
-    static_cast<os_signpost_id_t>(_signpostId),
-    "NitroWS", "close code=%d clean=%d", code, wasClean ? 1 : 0);
-#endif
-
-  OnClose cb;
-  {
-    std::lock_guard<std::mutex> lock(_cbMu);
-    cb = _onClose;
-  }
-  if (cb) cb(code, reason, wasClean);
-}
-
-void NWWebSocketConnection::fireError(const std::string& msg) {
-  _state.store(State::CLOSED, std::memory_order_release);
-
-#if defined(NITRO_WS_TRACING)
-  os_signpost_event_emit(nitroWsLog(),
-    static_cast<os_signpost_id_t>(_signpostId),
-    "NitroWS", "error %{public}s", msg.c_str());
-#endif
-
-  OnError cb;
-  {
-    std::lock_guard<std::mutex> lock(_cbMu);
-    cb = _onError;
-  }
-  if (cb) cb(msg);
-}
-
-
-// ── Factory ──────────────────────────────────────────────────────────────
 
 std::shared_ptr<WebSocketConnectionBase> createNWConnection() {
   return std::make_shared<NWWebSocketConnection>();

@@ -4,7 +4,6 @@
 
 #include "WebSocketConnectionBase.hpp"
 
-#include <deque>
 #include <mutex>
 #include <atomic>
 #include <memory>
@@ -41,43 +40,16 @@ private:
   struct Impl;
   std::unique_ptr<Impl> _impl;
 
+  void sendMessage(uint8_t opcode, const uint8_t* data, size_t len);
+
   std::string _url;
   std::string _negotiatedProtocol;
-  std::mutex _strMu;
+  std::string _extensions;
+  mutable std::mutex _strMu;
 
   std::atomic<State> _state{State::CONNECTING};
   std::atomic<size_t> _bufferedAmount{0};
-
-  OnOpen    _onOpen;
-  OnMessage _onMessage;
-  OnClose   _onClose;
-  OnError   _onError;
-  std::mutex _cbMu;
-
-  std::atomic<bool> _openFired{false};
-  std::atomic<bool> _closeFired{false};
-
-  struct BufferedMessage { std::vector<uint8_t> data; bool isBinary; };
-  std::deque<BufferedMessage> _msgBuffer;
-  std::mutex _msgMu;
-
-  // Who closed and why (0 = didn't). Neither set => transport dropped
-  // without a close handshake (1006).
-  // NB: NSURLSession maps close codes outside NSURLSessionWebSocketCloseCode
-  // (1012/1013/1014) to 1005 and drops the reason — the raw frame is not
-  // reachable through NSURLSessionWebSocketTask.
-  int _peerCloseCode{0};
-  std::string _peerCloseReason;
-  int _localCloseCode{0};
-  std::string _localCloseReason;
-
-  void scheduleReceive();
-  void fireClose(int code, const std::string& reason, bool wasClean);
-  void fireError(const std::string& msg);
-
-#if defined(NITRO_WS_TRACING)
-  uint64_t _signpostId = 0;
-#endif
+  std::mutex _sendMu;
 };
 
 std::shared_ptr<WebSocketConnectionBase> createNWConnection();
