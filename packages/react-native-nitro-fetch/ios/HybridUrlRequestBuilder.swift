@@ -173,6 +173,8 @@ private class URLSessionDelegateAdapter: NSObject, URLSessionDataDelegate, URLSe
   // Strong ref keeps the mapping alive while URLSession writes, even if JS drops its ArrayBuffer.
   private let nativeBuffer: ArrayBuffer?
   private let nativeBase: UnsafeMutableRawPointer?
+  // Set on the delegate queue when the native buffer rejects a chunk.
+  private var overflowed = false
 
   init(
     onRedirectReceived: ((_ info: UrlResponseInfo, _ newLocationUrl: String) -> Void)?,
@@ -233,6 +235,17 @@ private class URLSessionDelegateAdapter: NSObject, URLSessionDataDelegate, URLSe
         status = TSB_STATUS_DONE
       }
       tsb_set_status(base, UInt32(status))
+    }
+
+    if overflowed {
+      // Our own cancel(): report it as a failure, not as an abort the caller never asked for.
+      let capacity = nativeBuffer.map { $0.size - Int(TSB_HEADER_SIZE) } ?? 0
+      executor.sync { [weak self] in
+        guard let self = self else { return }
+        self.hybridRequest?.markDone()
+        self.onFailed?(self.response?.toNitro(), RequestException(message: "Native buffer overflow (capacity \(capacity) bytes)"))
+      }
+      return
     }
 
     executor.sync { [weak self] in
@@ -324,10 +337,13 @@ private class URLSessionDelegateAdapter: NSObject, URLSessionDataDelegate, URLSe
   ) {
     if let base = nativeBase {
       // Native mode: the body never crosses into JS; URLSession delivers on one serial queue.
-      data.withUnsafeBytes { raw in
-        if let src = raw.baseAddress, raw.count > 0 {
-          _ = tsb_append(base, src, UInt64(raw.count))
-        }
+      let accepted = data.withUnsafeBytes { raw -> Bool in
+        guard let src = raw.baseAddress, raw.count > 0 else { return true }
+        return tsb_append(base, src, UInt64(raw.count)) != 0
+      }
+      if !accepted && !overflowed {
+        overflowed = true
+        dataTask.cancel()
       }
       return
     }

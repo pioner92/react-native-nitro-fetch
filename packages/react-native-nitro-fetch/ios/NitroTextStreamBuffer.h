@@ -42,24 +42,26 @@ static inline void tsb_init(void *base, uint64_t capacity) {
   h->capacity = capacity;
 }
 
-/// Appends `len` bytes; single writer only. Returns 0 and sets OVERFLOW if they don't fit.
-static inline int tsb_append(void *base, const void *src, uint64_t len) {
-  TSBHeader *h = (TSBHeader *)base;
-  uint64_t committed = __atomic_load_n(&h->committed, __ATOMIC_RELAXED);
-  if (len > h->capacity - committed) {
-    __atomic_store_n(&h->status, TSB_STATUS_OVERFLOW, __ATOMIC_RELEASE);
-    return 0;
-  }
-  memcpy((uint8_t *)base + TSB_HEADER_SIZE + committed, src, (size_t)len);
-  __atomic_store_n(&h->committed, committed + len, __ATOMIC_RELEASE);
-  return 1;
-}
-
 static inline void tsb_set_status(void *base, uint32_t status) {
   TSBHeader *h = (TSBHeader *)base;
   uint32_t expected = TSB_STATUS_OPEN;
   // The first terminal status wins (an overflow is not overwritten by DONE).
   __atomic_compare_exchange_n(&h->status, &expected, status, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+/// Appends `len` bytes; single writer only. Returns 0 once closed, or sets OVERFLOW if they don't fit.
+static inline int tsb_append(void *base, const void *src, uint64_t len) {
+  TSBHeader *h = (TSBHeader *)base;
+  // Readers treat committed as final after a terminal status.
+  if (__atomic_load_n(&h->status, __ATOMIC_ACQUIRE) != TSB_STATUS_OPEN) return 0;
+  uint64_t committed = __atomic_load_n(&h->committed, __ATOMIC_RELAXED);
+  if (len > h->capacity - committed) {
+    tsb_set_status(base, TSB_STATUS_OVERFLOW);
+    return 0;
+  }
+  memcpy((uint8_t *)base + TSB_HEADER_SIZE + committed, src, (size_t)len);
+  __atomic_store_n(&h->committed, committed + len, __ATOMIC_RELEASE);
+  return 1;
 }
 
 static inline uint64_t tsb_committed(const void *base) {
